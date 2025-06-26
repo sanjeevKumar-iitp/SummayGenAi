@@ -3,5 +3,3 @@
 python -m venv env
 source env/bin/activate  
 pip install torch transformers pandas tqdm
-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
-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
