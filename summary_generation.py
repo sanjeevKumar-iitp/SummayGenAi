@@ -1,24 +1,29 @@
 import json
 import torch
 import gc
-from transformers import LlamaTokenizer, LlamaForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 import pandas as pd
+
 
 # Load JSON data
 def load_data(json_path):
     with open(json_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 # Pick up to `max_reviews` reviews per movie
 def get_movie_reviews(reviews, max_reviews=5):
     return [rev['review_text'] for rev in reviews[:max_reviews] if 'review_text' in rev]
 
+
 # Build prompt for model
 def build_prompt(movie_title, reviews):
-    prompt = f"""You are given {len(reviews)} reviews about the movie "{movie_title}". Read them carefully and generate two summaries:
+    prompt = f"""<|begin_of_sentence|>You are given {len(reviews)} reviews about the movie "{movie_title}". Read them carefully and generate two summaries:
 1. A positive summary highlighting what people liked about the movie.
 2. A negative summary outlining the main criticisms or dislikes.
+
+Read all the reviews and provide both summaries clearly and concisely.
 
 Reviews:
 """
@@ -29,6 +34,7 @@ Reviews:
 Positive Summary:
 """
     return prompt
+
 
 # Parse output into positive and negative summaries
 def parse_output(output):
@@ -50,7 +56,8 @@ def parse_output(output):
         print("Error parsing output:", str(e))
         return {"positive_summary": "", "negative_summary": ""}
 
-# Generate summaries using Llama 2.0 3B model
+
+# Generate summaries using Llama model
 def summarize_with_llama(model, tokenizer, prompt, device):
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     outputs = model.generate(
@@ -64,13 +71,14 @@ def summarize_with_llama(model, tokenizer, prompt, device):
     response = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return parse_output(response)
 
+
 # Main pipeline function
 def run_pipeline(
     json_path,
     output_file="movie_summaries.json",
-    MAX_MOVIES=10,               # Number of movies to process
-    START_OFFSET=0,              # Start from this index
-    MAX_REVIEWS_PER_MOVIE=5,     # Limit to N reviews per movie
+    MAX_MOVIES=10,
+    START_OFFSET=0,
+    MAX_REVIEWS_PER_MOVIE=5,
     MODEL_NAME="meta-llama/Llama-3.2-3B-Instruct"
 ):
     data = load_data(json_path)
@@ -82,9 +90,25 @@ def run_pipeline(
     print(f"Using device: {device}")
     print(f"Loading model: {MODEL_NAME}")
 
-    # Load tokenizer and model
-    tokenizer = LlamaTokenizer.from_pretrained(MODEL_NAME)
-    model = LlamaForCausalLM.from_pretrained(MODEL_NAME).to(device)
+    # Replace with your actual token
+    ACCESS_TOKEN = "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"
+
+    # Load tokenizer and model with access token
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_auth_token=ACCESS_TOKEN)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        device_map="auto",
+        torch_dtype=torch.float16,
+        use_auth_token=ACCESS_TOKEN
+    )
+    
+    # # Load tokenizer and model with optimizations
+    # tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     MODEL_NAME,
+    #     device_map="auto",             # Auto distributes layers across available devices
+    #     torch_dtype=torch.float16      # Use half-precision for faster inference
+    # )
 
     results = []
 
@@ -130,11 +154,12 @@ def run_pipeline(
 
     print(f"✅ Summaries saved to {output_file} and CSV version")
 
+
 if __name__ == "__main__":
     run_pipeline(
-        json_path="/Volumes/Sanjeev HD/M.TECH  IIT-P/Sem - 3 research/SonyResearchMovieRecommendation copy/pipeline/Data Prepration pipelines/output/json/grouped_reviews.json",
-        output_file="summaries_part1.json",
-        MAX_MOVIES=2,               # Change as needed
+        json_path="/root/SummayGenAi/grouped_reviews.json",
+        output_file="summaries.json",
+        MAX_MOVIES=2,
         START_OFFSET=0,
         MAX_REVIEWS_PER_MOVIE=10
     )
