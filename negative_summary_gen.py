@@ -23,8 +23,8 @@ def load_data(json_path):
     with open(json_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# ===== Filter Top N Reviews with Rating > 5 =====
-def get_movie_reviews(reviews):
+# ===== Filter Top N Negative Reviews (rating ≤ 5) =====
+def get_negative_reviews(reviews):
     filtered = []
     for rev in reviews[:MAX_REVIEWS_PER_MOVIE]:
         rating_str = rev.get("review_rating")
@@ -35,19 +35,19 @@ def get_movie_reviews(reviews):
             rating = int(rating_str)
         except (TypeError, ValueError):
             continue
-        if rating > 5:
+        if rating <= 5:
             filtered.append(text.strip())
     return filtered
 
-# ===== Build a Prompt for the LLM =====
-def build_prompt(title, year, reviews):
+# ===== Build a Prompt for Negative Summary =====
+def build_negative_prompt(title, year, reviews):
     review_snippets = "\n".join([f"{i}. {r[:250]}" for i, r in enumerate(reviews, 1)])
     return (
         f"<s>[INST] Title: {title} ({year})\n\n"
         f"Reviews:\n{review_snippets}\n\n"
-        "Summary: Write a concise positive summary of this movie based only on the above reviews. "
-        "Highlight strengths and positive points like story, acting, visuals, direction, or emotional impact. "
-        "Only include details explicitly mentioned in the reviews. Do also mention reviewers or audience opinions. Keep under 100 words."
+        "Summary: Write a concise negative summary of this movie based only on the above reviews. "
+        "Highlight weaknesses like poor acting, bad pacing, confusing plot, weak direction, or lack of emotional impact. "
+        "Only include details explicitly mentioned in the reviews. Do not mention reviewers or audience opinions. Keep under 100 words."
         "[/INST]"
     )
 
@@ -55,7 +55,7 @@ def build_prompt(title, year, reviews):
 def parse_summary(response):
     summary = response.strip()
     summary = re.sub(r"\s+", " ", summary)  # Normalize whitespace
-    return summary[:500]  # Adjust max char limit if needed
+    return summary[:500]  # Truncate safely
 
 # ===== Summarize with Token Control =====
 def summarize(model, tokenizer, prompt, device):
@@ -73,14 +73,14 @@ def summarize(model, tokenizer, prompt, device):
                 return_dict_in_generate=True,
                 output_scores=False
             )
-        # Slice only generated part, excluding prompt tokens
+        # Slice only generated part, excluding prompt
         generated_tokens = outputs.sequences[0][inputs['input_ids'].shape[1]:]
         return tokenizer.decode(generated_tokens, skip_special_tokens=True)
     except Exception as e:
         print(f"⚠️ Error during generation: {e}")
         return ""
 
-# ===== Append to JSON File Safely (no duplicates) =====
+# ===== Append to JSON File Safely =====
 def append_to_json_file(file_path, result):
     if os.path.exists(file_path):
         with open(file_path, "r+", encoding="utf-8") as f:
@@ -96,10 +96,10 @@ def append_to_json_file(file_path, result):
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump([result], f, indent=2)
 
-# ===== Pipeline to Generate Summaries =====
-def run_pipeline(
+# ===== Pipeline for Negative Summary =====
+def run_negative_pipeline(
     json_path,
-    output_file="positive_summaries.json",
+    output_file="negative_summaries.json",
     start_offset=0,
     max_movies=None
 ):
@@ -127,16 +127,16 @@ def run_pipeline(
         device_map="auto"
     ).eval()
 
-    for idx, imdb_id in tqdm(enumerate(imdb_ids), total=len(imdb_ids), desc="🔍 Summarizing"):
+    for idx, imdb_id in tqdm(enumerate(imdb_ids), total=len(imdb_ids), desc="🔍 Negative Summarizing"):
         reviews = data.get(imdb_id, [])
-        selected_reviews = get_movie_reviews(reviews)
+        selected_reviews = get_negative_reviews(reviews)
         if not selected_reviews:
             continue
 
         title = reviews[0].get('review_title', imdb_id)[:50] if reviews else imdb_id
         year = "Unknown"
 
-        prompt = build_prompt(title, year, selected_reviews)
+        prompt = build_negative_prompt(title, year, selected_reviews)
 
         try:
             raw_output = summarize(model, tokenizer, prompt, DEVICE)
@@ -147,23 +147,23 @@ def run_pipeline(
 
         result = {
             "imdb_id": imdb_id,
-            "positive_summary": summary
+            "negative_summary": summary
         }
 
         append_to_json_file(output_file, result)
-        print(f"💾 Saved summary for {imdb_id}")
+        print(f"💾 Saved negative summary for {imdb_id}")
 
         if idx % CHUNK_SIZE == 0 and DEVICE == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
 
-    print(f"✅ Final summaries saved to {output_file}")
+    print(f"✅ Final negative summaries saved to {output_file}")
 
 
 # ===== Entry Point =====
 if __name__ == "__main__":
-    run_pipeline(
+    run_negative_pipeline(
         json_path="/root/SummayGenAi/grouped_reviews.json",
-        output_file="positive_summaries.json",
+        output_file="negative_summaries.json",
         max_movies=6000
     )
