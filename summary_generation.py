@@ -1,140 +1,197 @@
+import os
 import json
-import torch
+import re
 import gc
-from transformers import LlamaTokenizer, LlamaForCausalLM
+import torch
 from tqdm import tqdm
-import pandas as pd
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from huggingface_hub import login
 
-# Load JSON data
+# ===== CONFIGURATION =====
+HF_TOKEN = ""
+MODEL_NAME = "Qwen/Qwen2.5-Coder-32B-Instruct"
+MAX_REVIEWS_PER_MOVIE = 5
+CHUNK_SIZE = 100
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+os.environ['TRANSFORMERS_CACHE'] = '/workspace/cache_dir'
+
+# ===== HuggingFace Login =====
+login(HF_TOKEN)
+
+# ===== Load JSON Data =====
 def load_data(json_path):
     with open(json_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# Pick up to `max_reviews` reviews per movie
-def get_movie_reviews(reviews, max_reviews=5):
-    return [rev['review_text'] for rev in reviews[:max_reviews] if 'review_text' in rev]
+# ===== Filter Top N Reviews with Rating > 1 =====
+def get_movie_reviews(reviews):
+    filtered = []
+    for rev in reviews[:MAX_REVIEWS_PER_MOVIE]:
+        rating_str = rev.get("review_rating")
+        text = rev.get("review_text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        try:
+            rating = int(rating_str)
+        except (TypeError, ValueError):
+            continue
+        if rating > 1:
+            filtered.append(text.strip())
+    return filtered
 
-# Build prompt for model
-def build_prompt(movie_title, reviews):
-    prompt = f"""You are given {len(reviews)} reviews about the movie "{movie_title}". Read them carefully and generate two summaries:
-1. A positive summary highlighting what people liked about the movie.
-2. A negative summary outlining the main criticisms or dislikes.
-
-Reviews:
-"""
-    for i, r in enumerate(reviews, start=1):
-        prompt += f"{i}. {r}\n"
-
-    prompt += """
-Positive Summary:
-"""
-    return prompt
-
-# Parse output into positive and negative summaries
-def parse_output(output):
-    try:
-        pos_start = output.find("Positive Summary:") + len("Positive Summary:")
-        neg_start = output.find("Negative Summary:")
-
-        positive_summary = output[pos_start:neg_start].strip()
-        negative_summary = output[neg_start + len("Negative Summary:"):].strip()
-
-        if "\n\n" in negative_summary:
-            negative_summary = negative_summary.split("\n\n")[0]
-
-        return {
-            "positive_summary": positive_summary,
-            "negative_summary": negative_summary
-        }
-    except Exception as e:
-        print("Error parsing output:", str(e))
-        return {"positive_summary": "", "negative_summary": ""}
-
-# Generate summaries using Llama 2.0 3B model
-def summarize_with_llama(model, tokenizer, prompt, device):
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=300,
-        temperature=0.3,
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id,
-        eos_token_id=tokenizer.eos_token_id
+# ===== Build Prompt for Positive Summary =====
+def build_prompt(title, year, reviews):
+    review_snippets = "\n".join([f"{i}. {r[:250]}" for i, r in enumerate(reviews, 1)])
+    return (
+        f"user\n"
+        f"Title: {title} ({year})\n\n"
+        f"Reviews:\n{review_snippets}\n\n"
+        "Summary: Write a detailed positive summary of this movie based only on the above reviews. "
+        "Highlight strengths like story, acting, visuals, direction, emotional impact, and reviewer opinions. "
+        "Only include details explicitly mentioned in the reviews. "
+        "Ensure the summary is **at least 100 words long**. Be thorough and descriptive."
+        f"\nassistant\n"
     )
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return parse_output(response)
 
-# Main pipeline function
-def run_pipeline(
-    json_path,
-    output_file="movie_summaries.json",
-    MAX_MOVIES=10,               # Number of movies to process
-    START_OFFSET=0,              # Start from this index
-    MAX_REVIEWS_PER_MOVIE=5,     # Limit to N reviews per movie
-    MODEL_NAME="meta-llama/Llama-3.2-3B-Instruct"
-):
-    data = load_data(json_path)
+# ===== Parse Summary and Ensure Length =====
+def parse_summary(response, min_words=150):
+    summary = response.strip()
+    summary = re.sub(r"\s+", " ", summary)
+    summary = re.sub(r"(?<!\.)\.\.(?!\.)", ".", summary)
 
-    imdb_ids = list(data.keys())[START_OFFSET:]  # Skip already processed movies
-    total_movies = min(MAX_MOVIES, len(imdb_ids))
+    # Ensure ends with punctuation
+    if summary and not re.search(r"[.!?]$", summary):
+        summary += "."  
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    print(f"Loading model: {MODEL_NAME}")
+    # Count words
+    word_count = len(summary.split())
+    print(f"📝 Generated summary has {word_count} words")
 
-    # Load tokenizer and model
-    tokenizer = LlamaTokenizer.from_pretrained(MODEL_NAME)
-    model = LlamaForCausalLM.from_pretrained(MODEL_NAME).to(device)
+    return summary, word_count
 
-    results = []
+# ===== Summarize with Retry Until Min Word Count =====
+def summarize(model, tokenizer, prompt, device, min_words=150, max_attempts=3):
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    
+    for attempt in range(max_attempts):
+        try:
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=600 if attempt == 0 else 800,  # Increase aggressively
+                    temperature=0.3,
+                    top_p=0.9,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=False
+                )
+            generated_tokens = outputs.sequences[0][inputs['input_ids'].shape[1]:]
+            raw_summary = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+            summary, word_count = parse_summary(raw_summary, min_words=min_words)
 
-    for idx, imdb_id in tqdm(enumerate(imdb_ids), desc="Processing Movies", total=total_movies):
-        if idx >= total_movies:
-            break
+            if word_count >= min_words:
+                return summary
 
-        reviews = data[imdb_id]
-        selected_reviews = get_movie_reviews(reviews, max_reviews=MAX_REVIEWS_PER_MOVIE)
+            print(f"🔄 Attempt {attempt + 1}: Summary too short. Retrying with more tokens...")
 
-        if not selected_reviews:
-            print(f"⚠️ No valid reviews found for movie {imdb_id}")
+        except Exception as e:
+            print(f"⚠️ Error during generation (attempt {attempt + 1}): {e}")
             continue
 
-        # Fallback for movie title
-        movie_title = imdb_id
-        if 'review_title' in reviews[0]:
-            movie_title = reviews[0]['review_title'][:50]
+    print("⚠️ Could not reach desired word count.")
+    return raw_summary if raw_summary else "Incomplete summary due to generation issues."
 
-        prompt = build_prompt(movie_title, selected_reviews)
-        summaries = summarize_with_llama(model, tokenizer, prompt, device)
+# ===== Append to JSON File Safely =====
+def append_to_json_file(file_path, result):
+    if os.path.exists(file_path):
+        with open(file_path, "r+", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = []
+            data.append(result)
+            f.seek(0)
+            json.dump(data, f, indent=2)
+            f.truncate()
+    else:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump([result], f, indent=2)
 
-        results.append({
+# ===== Pipeline to Generate Summaries =====
+def run_pipeline(
+    json_path,
+    output_file="positive_summaries.json",
+    start_offset=0,
+    max_movies=None
+):
+    data = load_data(json_path)
+    imdb_ids = list(data.keys())[start_offset:]
+    if max_movies:
+        imdb_ids = imdb_ids[:max_movies]
+
+    print(f"🧠 Total movies to process: {len(imdb_ids)}")
+    print(f"📦 Loading model: {MODEL_NAME} on {DEVICE}")
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        llm_int8_enable_fp32_cpu_offload=True  # Allow offloading
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+        low_cpu_mem_usage=True
+    ).eval()
+
+    model.resize_token_embeddings(len(tokenizer))
+
+    for idx, imdb_id in tqdm(enumerate(imdb_ids), total=len(imdb_ids), desc="🔍 Summarizing"):
+        reviews = data.get(imdb_id, [])
+        selected_reviews = get_movie_reviews(reviews)
+        if not selected_reviews:
+            continue
+
+        title = reviews[0].get('review_title', imdb_id)[:50] if reviews else imdb_id
+        year = "Unknown"
+
+        prompt = build_prompt(title, year, selected_reviews)
+
+        try:
+            summary = summarize(model, tokenizer, prompt, DEVICE, min_words=150)
+        except Exception as e:
+            print(f"❌ Error on {imdb_id}: {e}")
+            continue
+
+        result = {
             "imdb_id": imdb_id,
-            "title": movie_title,
-            "positive_summary": summaries["positive_summary"],
-            "negative_summary": summaries["negative_summary"]
-        })
+            "positive_summary": summary
+        }
 
-        # Clean memory
-        del reviews, selected_reviews, prompt, summaries
-        if device == "cuda":
+        append_to_json_file(output_file, result)
+        print(f"💾 Saved summary for {imdb_id}")
+
+        if idx % CHUNK_SIZE == 0 and DEVICE == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
 
-    # Save results to JSON
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
+    print(f"✅ Final summaries saved to {output_file}")
 
-    # Save to CSV
-    df = pd.DataFrame(results)
-    df.to_csv(output_file.replace(".json", ".csv"), index=False)
 
-    print(f"✅ Summaries saved to {output_file} and CSV version")
-
+# ===== Entry Point =====
 if __name__ == "__main__":
     run_pipeline(
-        json_path="/Volumes/Sanjeev HD/M.TECH  IIT-P/Sem - 3 research/SonyResearchMovieRecommendation copy/pipeline/Data Prepration pipelines/output/json/grouped_reviews.json",
-        output_file="summaries_part1.json",
-        MAX_MOVIES=2,               # Change as needed
-        START_OFFSET=0,
-        MAX_REVIEWS_PER_MOVIE=10
+        json_path="grouped_reviews.json",
+        output_file="qwen_positive_summaries.json",
+        max_movies=6000
     )
