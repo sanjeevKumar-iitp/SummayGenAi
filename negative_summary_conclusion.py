@@ -3,114 +3,73 @@ import json
 import re
 import gc
 import torch
+import time
+import multiprocessing as mp
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+    GenerationConfig
+)
 from huggingface_hub import login
-from transformers import GenerationConfig
 
-# ===== CONFIGURATION =====
-os.environ["ACCELERATE_USE_FSDP"] = "0"
-HF_TOKEN = ""  # ← Add your HuggingFace token here
+# CONFIG
+HF_TOKEN = ""  # Optional: insert your token if needed
 MODEL_NAME = "Qwen/Qwen2.5-Coder-32B-Instruct"
+INPUT_FILE = "outputs/qwen_negative_summaries.json"  # <- input with negative_summary fields
+OUTPUT_FILE = "outputs/final_negative_conclusions.json"
 CHUNK_SIZE = 100
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-os.environ['TRANSFORMERS_CACHE'] = '/workspace/cache_dir'
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["TRANSFORMERS_CACHE"] = "/workspace/cache_dir"
 
-# ===== HuggingFace Login =====
-login(HF_TOKEN)
+if HF_TOKEN:
+    login(HF_TOKEN)
 
-# ===== Load JSON Data =====
-def load_data(json_path):
-    with open(json_path, "r", encoding="utf-8") as f:
+def load_data(path):
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# ===== Build Prompt Based on Negative Summary =====
-def build_prompt(movie_title, negative_summary):
+def build_prompt(title, summary):
     return (
         f"user\n"
-        f"Movie Title: {movie_title}\n\n"
-        f"Negative Feedback:\n{negative_summary}\n\n"
-        "Summary: Write a concise and professional conclusion summarizing only the negative aspects of this movie. "
-        "Highlight issues mentioned in the text such as weak plot, bad acting, poor direction, low production quality, or lack of engagement. "
-        "Avoid exaggeration or positive remarks. Keep it under 100 words.\n"
+        f"Movie Title: {title}\n\n"
+        f"Negative Feedback:\n{summary}\n\n"
+        "Summary: Write a concise, engaging conclusion summarizing only the **negative aspects** of this movie. "
+        "Focus on criticism related to acting, story, direction, pacing, plot holes, visuals, or emotional impact. "
+        "Exclude any positive or neutral points. Keep it under 100 words. Sound analytical and critical, not rude.\n"
         f"\nassistant\n"
     )
 
-# ===== Clean & Parse LLM Output =====
-def parse_summary(response):
-    summary = response.strip()
-    summary = re.sub(r"\s+", " ", summary)
-    if summary and not re.search(r"[.!?]$", summary):
-        summary += "."  # Ensure ends with punctuation
-    return summary
+def parse_summary(text):
+    text = text.strip()
+    text = re.sub(r"\s+", " ", text)
+    return text if text.endswith((".", "!", "?")) else text + "."
 
-# ===== Generate Summary Using Qwen Model (Fast Mode) =====
-def summarize(model, tokenizer, prompt, device):
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-    generation_config = GenerationConfig(
-        max_new_tokens=120,
-        min_new_tokens=80,
-        do_sample=False,
-        num_beams=1,
-        pad_token_id=tokenizer.eos_token_id,
-        eos_token_id=tokenizer.eos_token_id
-    )
-
-    try:
-        outputs = model.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            generation_config=generation_config
-        )
-        generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-        return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-    except Exception as e:
-        print(f"⚠️ Error during generation: {e}")
-        return ""
-
-# ===== Append Result Safely to JSON File =====
-def append_to_json_file(file_path, result):
-    if os.path.exists(file_path):
-        with open(file_path, "r+", encoding="utf-8") as f:
+def append_to_json_file(path, batch):
+    if os.path.exists(path):
+        with open(path, "r+", encoding="utf-8") as f:
             try:
                 data = json.load(f)
             except json.JSONDecodeError:
                 data = []
-            data.append(result)
+            data.extend(batch)
             f.seek(0)
             json.dump(data, f, indent=2)
             f.truncate()
     else:
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump([result], f, indent=2)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(batch, f, indent=2)
 
-# ===== Pipeline to Generate Negative Conclusions =====
-def run_conclusion_pipeline(
-    input_summary_file="qwen_negative_summaries.json",
-    output_file="final_negative_conclusions.json",
-    start_offset=0,
-    max_movies=None
-):
-    print("🧠 Loading existing negative summaries...")
-    data = load_data(input_summary_file)
-
-    if start_offset > len(data):
-        print("⚠️ Start offset exceeds data size.")
-        return
-
-    movies = data[start_offset:]
-    if max_movies:
-        movies = movies[:max_movies]
-
-    print(f"📦 Loading model: {MODEL_NAME} on {DEVICE}")
+def run_worker(gpu_id, chunk, output_path):
+    torch.cuda.set_device(gpu_id)
+    print(f"[GPU {gpu_id}] Loading model...")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        llm_int8_enable_fp32_cpu_offload=True
+        bnb_4bit_compute_dtype=torch.float16
     )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -120,51 +79,74 @@ def run_conclusion_pipeline(
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         quantization_config=bnb_config,
-        device_map="auto",
+        device_map={"": gpu_id},
         trust_remote_code=True,
-        low_cpu_mem_usage=False
+        low_cpu_mem_usage=True
     ).eval()
 
     model.resize_token_embeddings(len(tokenizer))
 
-    for idx, entry in enumerate(tqdm(movies, desc="🎬 Generating Negative Conclusions")):
-        imdb_id = entry.get("imdb_id")
-        negative_summary = entry.get("negative_summary", "").strip()
+    results = []
 
-        if not negative_summary:
-            print(f"🚫 No negative summary found for {imdb_id}. Skipping...")
+    for entry in tqdm(chunk, desc=f"[GPU {gpu_id}] Generating"):
+        imdb_id = entry.get("imdb_id")
+        neg_summary = entry.get("negative_summary", "").strip()
+        if not neg_summary:
             continue
 
-        movie_title = imdb_id  # Replace with actual title if needed
-
-        prompt = build_prompt(movie_title, negative_summary)
+        prompt = build_prompt(imdb_id, neg_summary)
+        inputs = tokenizer(prompt, return_tensors="pt").to(f"cuda:{gpu_id}")
+        gen_config = GenerationConfig(
+            max_new_tokens=120,
+            min_new_tokens=80,
+            do_sample=False,
+            num_beams=1,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id
+        )
 
         try:
-            raw_output = summarize(model, tokenizer, prompt, DEVICE)
-            conclusion = parse_summary(raw_output)
+            with torch.no_grad():
+                output = model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    generation_config=gen_config
+                )
+            generated = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            results.append({"imdb_id": imdb_id, "conclusion": parse_summary(generated)})
         except Exception as e:
-            print(f"❌ Error generating conclusion for {imdb_id}: {e}")
+            print(f"[GPU {gpu_id}] ❌ Error: {e}")
             continue
 
-        result = {
-            "imdb_id": imdb_id,
-            "conclusion": conclusion
-        }
-
-        append_to_json_file(output_file, result)
-        print(f"💾 Saved negative conclusion for {imdb_id}")
-
-        if idx % CHUNK_SIZE == 0 and DEVICE == "cuda":
+        if len(results) % CHUNK_SIZE == 0:
+            append_to_json_file(output_path, results)
+            results.clear()
             torch.cuda.empty_cache()
-        gc.collect()
+            gc.collect()
 
-    print(f"✅ Final negative conclusions saved to {output_file}")
+    if results:
+        append_to_json_file(output_path, results)
 
+def parallel_negative_conclusion_pipeline(max_movies=6000):
+    data = load_data(INPUT_FILE)
+    if max_movies:
+        data = data[:max_movies]
 
-# ===== Entry Point =====
+    num_gpus = torch.cuda.device_count()
+    print(f"🚀 Starting NEGATIVE conclusion generation on {num_gpus} GPUs")
+
+    chunks = [data[i::num_gpus] for i in range(num_gpus)]
+
+    processes = []
+    for gpu_id, chunk in enumerate(chunks):
+        p = mp.Process(target=run_worker, args=(gpu_id, chunk, OUTPUT_FILE))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
 if __name__ == "__main__":
-    run_conclusion_pipeline(
-        input_summary_file="qwen_negative_summaries.json",
-        output_file="final_negative_conclusions.json",
-        max_movies=6000
-    )
+    start = time.time()
+    parallel_negative_conclusion_pipeline()
+    print(f"✅ Negative conclusions generated in {(time.time() - start) / 60:.2f} minutes")
