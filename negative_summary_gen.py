@@ -9,7 +9,7 @@ from huggingface_hub import login
 
 # ===== CONFIGURATION =====
 HF_TOKEN = ""
-MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
+MODEL_NAME = "Qwen/Qwen2.5-Coder-32B-Instruct"
 MAX_REVIEWS_PER_MOVIE = 5
 CHUNK_SIZE = 100
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -23,8 +23,8 @@ def load_data(json_path):
     with open(json_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# ===== Filter Top N Negative Reviews (rating ≤ 5) =====
-def get_negative_reviews(reviews):
+# ===== Filter Top N Reviews with Rating > 1 =====
+def get_movie_reviews(reviews):
     filtered = []
     for rev in reviews[:MAX_REVIEWS_PER_MOVIE]:
         rating_str = rev.get("review_rating")
@@ -35,50 +35,73 @@ def get_negative_reviews(reviews):
             rating = int(rating_str)
         except (TypeError, ValueError):
             continue
-        if rating <= 5:
+        if rating < 9:
             filtered.append(text.strip())
     return filtered
 
-# ===== Build a Prompt for Negative Summary =====
-def build_negative_prompt(title, year, reviews):
+# ===== Build Prompt for Positive Summary =====
+def build_prompt(title, year, reviews):
     review_snippets = "\n".join([f"{i}. {r[:250]}" for i, r in enumerate(reviews, 1)])
     return (
-        f"<s>[INST] Title: {title} ({year})\n\n"
+        f"user\n"
+        f"Title: {title} ({year})\n\n"
         f"Reviews:\n{review_snippets}\n\n"
         "Summary: Write a concise negative summary of this movie based only on the above reviews. "
         "Highlight weaknesses like poor acting, bad pacing, confusing plot, weak direction, or lack of emotional impact. "
-        "Only include details explicitly mentioned in the reviews. Do not mention reviewers or audience opinions. Keep under 100 words."
-        "[/INST]"
+        "Only include details explicitly mentioned in the reviews. Do mention reviewers or audience opinions. "
+        "Ensure the summary is between 150 to 200 words long. Be descriptive but concise."
+        f"\nassistant\n"
     )
 
-# ===== Parse the Summary Response from LLM Output =====
-def parse_summary(response):
+# ===== Parse Summary and Ensure Length =====
+def parse_summary(response, min_words=150):
     summary = response.strip()
-    summary = re.sub(r"\s+", " ", summary)  # Normalize whitespace
-    return summary[:500]  # Truncate safely
+    summary = re.sub(r"\s+", " ", summary)
+    summary = re.sub(r"(?<!\.)\.\.(?!\.)", ".", summary)
 
-# ===== Summarize with Token Control =====
-def summarize(model, tokenizer, prompt, device):
+    # Ensure ends with punctuation
+    if summary and not re.search(r"[.!?]$", summary):
+        summary += "."  
+
+    # Count words
+    word_count = len(summary.split())
+    print(f"📝 Generated summary has {word_count} words")
+
+    return summary, word_count
+
+# ===== Summarize with Retry Until Min Word Count =====
+def summarize(model, tokenizer, prompt, device, min_words=100, max_attempts=3):
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    try:
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=150,
-                temperature=0.3,
-                top_p=0.9,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                return_dict_in_generate=True,
-                output_scores=False
-            )
-        # Slice only generated part, excluding prompt
-        generated_tokens = outputs.sequences[0][inputs['input_ids'].shape[1]:]
-        return tokenizer.decode(generated_tokens, skip_special_tokens=True)
-    except Exception as e:
-        print(f"⚠️ Error during generation: {e}")
-        return ""
+
+    for attempt in range(max_attempts):
+        try:
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=600 if attempt == 0 else 800,
+                    temperature=0.3,
+                    top_p=0.9,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=False
+                )
+            generated_tokens = outputs.sequences[0][inputs['input_ids'].shape[1]:]
+            raw_summary = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+            summary, word_count = parse_summary(raw_summary, min_words=min_words)
+
+            # ✅ Save if we hit or exceed minimum required word count
+            if word_count >= min_words:
+                print(f"✅ Summary meets word requirement ({word_count} words).")
+                return summary
+
+            print(f"🔄 Attempt {attempt + 1}: Too short ({word_count} words). Retrying...")
+        except Exception as e:
+            print(f"⚠️ Error during generation (attempt {attempt + 1}): {e}")
+
+    print("⚠️ Could not reach minimum word count after all attempts.")
+    return raw_summary if raw_summary else "Incomplete summary due to generation issues."
 
 # ===== Append to JSON File Safely =====
 def append_to_json_file(file_path, result):
@@ -96,10 +119,10 @@ def append_to_json_file(file_path, result):
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump([result], f, indent=2)
 
-# ===== Pipeline for Negative Summary =====
-def run_negative_pipeline(
+# ===== Pipeline to Generate Summaries =====
+def run_pipeline(
     json_path,
-    output_file="negative_summaries.json",
+    output_file="positive_summaries.json",
     start_offset=0,
     max_movies=None
 ):
@@ -113,34 +136,39 @@ def run_negative_pipeline(
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        llm_int8_enable_fp32_cpu_offload=True  # Allow offloading
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         quantization_config=bnb_config,
-        device_map="auto"
+        device_map="auto",
+        trust_remote_code=True,
+        low_cpu_mem_usage=True
     ).eval()
 
-    for idx, imdb_id in tqdm(enumerate(imdb_ids), total=len(imdb_ids), desc="🔍 Negative Summarizing"):
+    model.resize_token_embeddings(len(tokenizer))
+
+    for idx, imdb_id in tqdm(enumerate(imdb_ids), total=len(imdb_ids), desc="🔍 Summarizing"):
         reviews = data.get(imdb_id, [])
-        selected_reviews = get_negative_reviews(reviews)
+        selected_reviews = get_movie_reviews(reviews)
         if not selected_reviews:
             continue
 
         title = reviews[0].get('review_title', imdb_id)[:50] if reviews else imdb_id
         year = "Unknown"
 
-        prompt = build_negative_prompt(title, year, selected_reviews)
+        prompt = build_prompt(title, year, selected_reviews)
 
         try:
-            raw_output = summarize(model, tokenizer, prompt, DEVICE)
-            summary = parse_summary(raw_output)
+            summary = summarize(model, tokenizer, prompt, DEVICE, min_words=150)
         except Exception as e:
             print(f"❌ Error on {imdb_id}: {e}")
             continue
@@ -151,19 +179,19 @@ def run_negative_pipeline(
         }
 
         append_to_json_file(output_file, result)
-        print(f"💾 Saved negative summary for {imdb_id}")
+        print(f"💾 Saved summary for {imdb_id}")
 
         if idx % CHUNK_SIZE == 0 and DEVICE == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
 
-    print(f"✅ Final negative summaries saved to {output_file}")
+    print(f"✅ Final summaries saved to {output_file}")
 
 
 # ===== Entry Point =====
 if __name__ == "__main__":
-    run_negative_pipeline(
-        json_path="/root/SummayGenAi/grouped_reviews.json",
-        output_file="negative_summaries.json",
+    run_pipeline(
+        json_path="grouped_reviews.json",
+        output_file="qwen_negative_summaries.json",
         max_movies=6000
     )
