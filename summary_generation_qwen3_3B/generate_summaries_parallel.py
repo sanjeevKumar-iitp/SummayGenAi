@@ -13,6 +13,10 @@ import glob
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
+# Enable faster math (TF32)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 # Load embedding model
 embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 cached_dir = "/hf_models/"
@@ -22,10 +26,11 @@ pref = "user_pref_master.csv"
 model_name = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
 tokenizer1 = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, cache_dir=cached_dir)
 model1 = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto", device_map="auto", trust_remote_code=True, cache_dir=cached_dir)
+model1 = torch.compile(model1)  # Compile for faster execution (PyTorch ≥2.0)
 
 tokenizer2 = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, cache_dir=cached_dir)
 model2 = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto", device_map="auto", trust_remote_code=True, cache_dir=cached_dir)
-
+model2 = torch.compile(model2)
 
 def compute_cosine_similarity(summary, next_likes_dict):
     try:
@@ -36,7 +41,6 @@ def compute_cosine_similarity(summary, next_likes_dict):
     sim = cosine_similarity([embeddings[0]], [embeddings[1]])
     return float(sim[0][0])
 
-
 def query_model(prompt, model, tokenizer):
     messages = [{"role": "user", "content": prompt}]
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -44,15 +48,14 @@ def query_model(prompt, model, tokenizer):
 
     generated_ids = model.generate(
         **model_inputs,
-        max_new_tokens=1500,
-        do_sample=True,
-        temperature=0.9,
-        top_p=0.95
+        max_new_tokens=100,  # Reduced from 1500
+        do_sample=False,      # Disabled sampling
+        temperature=1.0,
+        top_p=1.0
     )
     output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
     content = tokenizer.decode(output_ids, skip_special_tokens=True).strip("\n")
     return content
-
 
 def generate_best_summary(row, model, tokenizer, local_df):
     likes_dict = row["_likes_dict"]
@@ -81,15 +84,9 @@ def generate_best_summary(row, model, tokenizer, local_df):
     best = max(candidates, key=lambda x: x[1])
     return best[0]
 
-
 def process_user_rows(local_df, model, tokenizer):
-    # Sort and prepare
     local_df = local_df.sort_values(by=['user_id', 'cluster_id', 'movie_id']).reset_index(drop=True)
-
-    # Pre-parse likes_dict to avoid repeated parsing
     local_df["_likes_dict"] = local_df["likes"].apply(ast.literal_eval)
-
-    # Initialize summary columns
     local_df['prev_summary'] = ""
     local_df['best_summary'] = ""
     summary_memory = {}
@@ -112,7 +109,6 @@ def process_user_rows(local_df, model, tokenizer):
         local_df.at[idx, 'best_summary'] = best
         summary_memory[key] = best
 
-        # Save when switching to a new cluster
         if last_cluster is not None and last_cluster != key:
             cluster_df = local_df[(local_df['user_id'] == last_cluster[0]) & (local_df['cluster_id'] == last_cluster[1])]
             cluster_path = os.path.join(output_dir, f"user_{last_cluster[0]}_cluster_{last_cluster[1]}.csv")
@@ -120,7 +116,6 @@ def process_user_rows(local_df, model, tokenizer):
             logging.info(f"Saved checkpoint: {cluster_path}")
         last_cluster = key
 
-    # Final save for last cluster
     if last_cluster:
         cluster_df = local_df[(local_df['user_id'] == last_cluster[0]) & (local_df['cluster_id'] == last_cluster[1])]
         cluster_path = os.path.join(output_dir, f"user_{last_cluster[0]}_cluster_{last_cluster[1]}.csv")
@@ -129,22 +124,19 @@ def process_user_rows(local_df, model, tokenizer):
 
     return local_df
 
-
 # Load and reverse the input data
 df = pd.read_csv(pref)
-df = df[::-1].reset_index(drop=True)  # <-- Process from last to first row
+df = df[::-1].reset_index(drop=True)
 
 # Precompute has_next_movie
 user_groups = df.groupby('user_id', sort=False)
 has_next_movie = []
-
 for _, group in user_groups:
     indices = group.index.tolist()
     has_next = [False] * len(indices)
     for i in range(len(indices) - 1):
         has_next[i] = True
     has_next_movie.extend(has_next)
-
 df['has_next_movie'] = has_next_movie
 
 # Final sort and initialize summary columns
